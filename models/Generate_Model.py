@@ -124,7 +124,7 @@ class GenerateModel(nn.Module):
         
         
         #Add two-layer MLP projectors for fusion bottleneck
-        self.image_up_proj = MLPProjector(in_dim=128, hidden_dim=256, out_dim=128)
+        self.image_up_proj = MLPProjector(in_dim=64, hidden_dim=256, out_dim=128)
 
     def _build_audio_model(self, model_name='vit_base_patch16', drop_path_rate=0.1, global_pool=False, mask_2d=True, use_custom_patch=False, ckpt_path='audiomae_pretrained.pth'):
         self.audio_model = audio_models_vit.__dict__[model_name](
@@ -181,25 +181,30 @@ class GenerateModel(nn.Module):
         assert t == 16
         B = image.shape[0]
 
-        for ii in range(len(self.audio_model.blocks)):
-            audio = self.audio_model.forward_block_pre(ii, audio)
-            image = self.image_encoder.forward_block_pre(ii, image, B)
+        """
+        Up-project image BEFORE encoder
+        (Suppose image tokens at this stage are 64-d)
+        Shape: (B, N_img, 64) -> (B, N_img, 128)
+        """
+        image_tokens = self.image_up_proj(image)       # (B, N_img, 128)
 
-            # Fusion bottleneck with two-layer MLPs
+        for ii in range(len(self.audio_model.blocks)):
+            # audio passes through its own block
+            audio = self.audio_model.forward_block_pre(ii, audio)
+
+            # feed image tokens into encoder with up-projected features
+            image = self.image_encoder.forward_block_pre(ii, image_tokens, B)
+
             image_lowdim_temp = self.image_encoder.temporal_pre[ii](image)
             image_lowdim_norm = self.image_encoder.temporal_pre_norm[ii](image_lowdim_temp)
 
             audio_lowdim = self.image_encoder.audio_proj_pre[ii](audio)
+            audio_lowdim_proj = self.audio_up_proj(audio_lowdim)
 
-            # Project both modalities to richer latent space
-            image_lowdim_proj = self.image_up_proj(image_lowdim_norm)
-
-            # Cross-modal exchange
-            image_lowdim_fused = image_lowdim_proj + audio_lowdim.mean(1).unsqueeze(1).repeat_interleave(t, 0)
-            audio_lowdim_fused = audio_lowdim + image_lowdim_proj.view(
+            image_lowdim_fused = image_lowdim_norm + audio_lowdim_proj.mean(1).unsqueeze(1).repeat_interleave(t, 0)
+            audio_lowdim_fused = audio_lowdim_proj + image_lowdim_norm.view(
                 B // t, t, self.n_image + 6 + 1, 128).mean(1).mean(1).unsqueeze(1)
 
-            # Inject back
             image = self.image_encoder.forward_block_post(ii, image, image_lowdim_fused, B)
             audio = self.audio_model.forward_block_post(ii, audio, audio_lowdim_fused)
 
