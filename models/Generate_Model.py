@@ -198,11 +198,11 @@ class GenerateModel(nn.Module):
             image_lowdim_temp = self.image_encoder.temporal_pre[ii](image)
             image_lowdim_norm = self.image_encoder.temporal_pre_norm[ii](image_lowdim_temp)
 
-            audio_lowdim = self.image_encoder.audio_proj_pre[ii](audio)
-            audio_lowdim_proj = self.audio_up_proj(audio_lowdim)
+            audio_lowdim = self.image_encoder.audio_proj_pre[ii](audio) 
 
-            image_lowdim_fused = image_lowdim_norm + audio_lowdim_proj.mean(1).unsqueeze(1).repeat_interleave(t, 0)
-            audio_lowdim_fused = audio_lowdim_proj + image_lowdim_norm.view(
+
+            image_lowdim_fused = image_lowdim_norm + audio_lowdim.mean(1).unsqueeze(1).repeat_interleave(t, 0)
+            audio_lowdim_fused = audio_lowdim + image_lowdim_norm.view(
                 B // t, t, self.n_image + 6 + 1, 128).mean(1).mean(1).unsqueeze(1)
 
             image = self.image_encoder.forward_block_post(ii, image, image_lowdim_fused, B)
