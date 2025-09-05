@@ -82,6 +82,22 @@ class PatchEmbed_new(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         return x
 
+class MLPProjector(nn.Module):
+    """
+    Two-layer MLP to project features to a target dimension
+    """
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+            nn.LayerNorm(out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 class GenerateModel(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -105,6 +121,10 @@ class GenerateModel(nn.Module):
         self._build_audio_model() 
         
         assert len(self.audio_model.blocks) == len(self.image_encoder.blocks)
+        
+        
+        #Add two-layer MLP projectors for fusion bottleneck
+        self.image_up_proj = MLPProjector(in_dim=128, hidden_dim=256, out_dim=128)
 
     def _build_audio_model(self, model_name='vit_base_patch16', drop_path_rate=0.1, global_pool=False, mask_2d=True, use_custom_patch=False, ckpt_path='audiomae_pretrained.pth'):
         self.audio_model = audio_models_vit.__dict__[model_name](
@@ -156,7 +176,6 @@ class GenerateModel(nn.Module):
         self.image_encoder.pos_embed = nn.Parameter(pos_embed)
          
     def forward(self, image, audio):
- 
         n, t, c, h, w = image.shape
         image = image.contiguous().view(-1, c, h, w)
         assert t == 16
@@ -164,24 +183,29 @@ class GenerateModel(nn.Module):
 
         for ii in range(len(self.audio_model.blocks)):
             audio = self.audio_model.forward_block_pre(ii, audio)
-            image  = self.image_encoder.forward_block_pre(ii, image, B)
+            image = self.image_encoder.forward_block_pre(ii, image, B)
 
+            # Fusion bottleneck with two-layer MLPs
             image_lowdim_temp = self.image_encoder.temporal_pre[ii](image)
             image_lowdim_norm = self.image_encoder.temporal_pre_norm[ii](image_lowdim_temp)
 
-            audio_lowdim = self.image_encoder.audio_proj_pre[ii](audio)        
+            audio_lowdim = self.image_encoder.audio_proj_pre[ii](audio)
 
-            image_lowdim_norm2 = image_lowdim_norm + audio_lowdim.mean(1).unsqueeze(1).repeat_interleave(t,0)
-            audio_lowdim2 = audio_lowdim + image_lowdim_norm.view(B//t, t, self.n_image + 6 + 1, 128).mean(1).mean(1).unsqueeze(1) 
+            # Project both modalities to richer latent space
+            image_lowdim_proj = self.image_up_proj(image_lowdim_norm)
 
-            image = self.image_encoder.forward_block_post(ii, image, image_lowdim_norm2, B)
-            audio = self.audio_model.forward_block_post(ii, audio, audio_lowdim2)
+            # Cross-modal exchange
+            image_lowdim_fused = image_lowdim_proj + audio_lowdim.mean(1).unsqueeze(1).repeat_interleave(t, 0)
+            audio_lowdim_fused = audio_lowdim + image_lowdim_proj.view(
+                B // t, t, self.n_image + 6 + 1, 128).mean(1).mean(1).unsqueeze(1)
+
+            # Inject back
+            image = self.image_encoder.forward_block_post(ii, image, image_lowdim_fused, B)
+            audio = self.audio_model.forward_block_post(ii, audio, audio_lowdim_fused)
 
         image = image.contiguous().view(n, t, -1)
-        image = self.vision_proj(image+audio.unsqueeze(1)) 
+        image = self.vision_proj(image + audio.unsqueeze(1))
 
         video_features = self.temporal_net(image)
- 
         output = self.our_classifier(video_features)
-
         return output
